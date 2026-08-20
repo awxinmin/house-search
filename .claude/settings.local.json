@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv init *)",
+      "Bash(uv venv *)",
+      "Bash(uv add *)",
+      "Bash(uv run *)"
+    ]
+  },
+  "disabledMcpjsonServers": [
+    "google-maps"
+  ]
+}

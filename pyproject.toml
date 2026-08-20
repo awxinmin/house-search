@@ -1,0 +1,11 @@
+[project]
+name = "house-search-agent"
+version = "0.1.0"
+description = "Daily PropertyGuru listing scraper and analyser"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "anthropic>=0.34",
+]
