@@ -1,45 +1,65 @@
-"""PropertyGuru listing scraper using __NEXT_DATA__ JSON with HTML fallback."""
+"""PropertyGuru listing scraper.
+
+Search pages: listing IDs/URLs come from __NEXT_DATA__.props.pageProps.pageData.data.contactAgentCardData
+Detail pages: full data from listingData + detailsData.metatable.items
+Pagination: requires Referer header on page 2+; session persists Cloudflare cookies.
+"""
 
 import json
 import re
 import time
 from urllib.parse import urlencode, urljoin
 
-import httpx
 from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
 from config import BASE_URL, LISTING_BASE_URL, MAX_PAGES_PER_RUN
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
+_IMPERSONATE = "chrome124"
+
+_BASE_HEADERS = {
     "Accept-Language": "en-SG,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
     "Upgrade-Insecure-Requests": "1",
 }
 
-_ONGOING_OFFER_RE = re.compile(
+_ONGOING_RE = re.compile(
     r"ongoing\s+offer|offer\s+ongoing|under\s+offer|offer\s+received|option\s+exercised",
+    re.I,
+)
+_EXT_NEG_RE = re.compile(
+    r"no\s+(?:\w+\s+){0,3}extension"
+    r"|move[\s-]?in\s+immediately"
+    r"|immediate\s+move[\s-]?in"
+    r"|immediate\s+(?:vacant\s+)?(?:possession|occupancy)"
+    r"|vacant\s+(?:unit,?\s+)?immediate",
+    re.I,
+)
+_EXT_POS_RE = re.compile(
+    r"extension\s+(?:of\s+stay\s+)?(?:is\s+)?(?:required|requested|needed|preferred)"
+    r"|(?:require|need|prefer)(?:s|d)?\s+(?:an?\s+)?extension"
+    r"|\d+[\s-]*(?:month|mth|mo)s?\s+extension"
+    r"|extension\s+of\s+stay",
+    re.I,
+)
+_CORNER_RE = re.compile(
+    r"\bcorner\s+(?:unit|stack|apartment)\b|\bstand[\s-]?alone\s+corner\b|\bend\s+unit\b", re.I
+)
+_MRT_RE = re.compile(
+    r"(?:walk(?:ing)?\s+(?:distance\s+)?to\s+|near(?:est)?\s+|minutes?\s+(?:walk\s+)?to\s+)"
+    r"([A-Za-z][A-Za-z\s/]+?)\s+MRT",
+    re.I,
+)
+_MRT_DIST_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:km|m(?:etres?|inutess?)?)\s+(?:from|to|away)?\s*(?:[A-Za-z\s]+\s+)?MRT",
     re.I,
 )
 
 
 # ── URL builders ─────────────────────────────────────────────────────────────
 
-def _build_url(base_params: list[tuple], page: int, listed_in_days: int | None) -> str:
+def _build_url(base_params: list, page: int, listed_in_days) -> str:
     p = list(base_params)
     if listed_in_days:
         p.append(("listedIn", str(listed_in_days)))
@@ -48,68 +68,58 @@ def _build_url(base_params: list[tuple], page: int, listed_in_days: int | None) 
     return f"{BASE_URL}?{urlencode(p)}"
 
 
-def build_hdb_url(page: int = 1, listed_in_days: int | None = None) -> str:
+def build_hdb_url(page: int = 1, listed_in_days=None) -> str:
     return _build_url(
         [
-            ("hdbEstate", "1"),
-            ("hdbEstate", "25"),
-            ("hdbEstate", "3"),
+            ("hdbEstate", "1"), ("hdbEstate", "25"), ("hdbEstate", "3"),
             ("propertyTypeGroup", "H"),
-            ("propertyTypeCode", "5A"),
-            ("propertyTypeCode", "5I"),
-            ("propertyTypeCode", "5S"),
-            ("propertyTypeCode", "5PA"),
+            ("propertyTypeCode", "5A"), ("propertyTypeCode", "5I"),
+            ("propertyTypeCode", "5S"), ("propertyTypeCode", "5PA"),
             ("bedrooms", "3"),
             ("minSize", "1000"),
             ("distanceToMRT", "0.75"),
             ("minTopYear", "1990"),
         ],
-        page,
-        listed_in_days,
+        page, listed_in_days,
     )
 
 
-def build_condo_url(page: int = 1, listed_in_days: int | None = None) -> str:
+def build_condo_url(page: int = 1, listed_in_days=None) -> str:
     return _build_url(
         [
-            ("mrtStations", "CC15"),
-            ("mrtStations", "CC16"),
-            ("mrtStations", "CC17"),
-            ("mrtStations", "CR11"),
-            ("mrtStations", "CR13"),
-            ("mrtStations", "NS15"),
-            ("mrtStations", "NS16"),
-            ("mrtStations", "NS17"),
-            ("mrtStations", "TE5"),
-            ("mrtStations", "TE6"),
-            ("mrtStations", "TE7"),
-            ("mrtStations", "TE9"),
+            ("mrtStations", "CC15"), ("mrtStations", "CC16"), ("mrtStations", "CC17"),
+            ("mrtStations", "CR11"), ("mrtStations", "CR13"),
+            ("mrtStations", "NS15"), ("mrtStations", "NS16"), ("mrtStations", "NS17"),
+            ("mrtStations", "TE5"), ("mrtStations", "TE6"),
+            ("mrtStations", "TE7"), ("mrtStations", "TE9"),
             ("maxPrice", "2700000"),
-            ("bedrooms", "3"),
-            ("bedrooms", "4"),
+            ("bedrooms", "3"), ("bedrooms", "4"),
             ("minSize", "1000"),
             ("minTopYear", "2000"),
             ("propertyTypeGroup", "N"),
         ],
-        page,
-        listed_in_days,
+        page, listed_in_days,
     )
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── HTTP ──────────────────────────────────────────────────────────────────────
 
-def _client() -> httpx.Client:
-    return httpx.Client(timeout=30, follow_redirects=True, http2=True)
+def _client() -> cffi_requests.Session:
+    return cffi_requests.Session(impersonate=_IMPERSONATE)
 
 
-def _fetch(url: str, client: httpx.Client, delay: float = 2.5) -> str:
+def _fetch(url: str, client: cffi_requests.Session, referer: str = None, delay: float = 2.5) -> str:
     time.sleep(delay)
-    resp = client.get(url, headers=_HEADERS)
+    headers = dict(_BASE_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+        headers["Sec-Fetch-Site"] = "same-origin"
+    resp = client.get(url, headers=headers, timeout=30, allow_redirects=True)
     resp.raise_for_status()
     return resp.text
 
 
-# ── Parsing ───────────────────────────────────────────────────────────────────
+# ── __NEXT_DATA__ helpers ─────────────────────────────────────────────────────
 
 def _next_data(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
@@ -122,299 +132,196 @@ def _next_data(html: str) -> dict:
     return {}
 
 
-def _int(val) -> int:
-    if isinstance(val, (int, float)):
-        return int(val)
-    if isinstance(val, str):
-        clean = re.sub(r"[^\d]", "", val)
-        return int(clean) if clean else 0
-    return 0
+def _page_data(nd: dict) -> dict:
+    return nd.get("props", {}).get("pageProps", {}).get("pageData", {})
 
 
-def _float(val) -> float:
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        clean = re.sub(r"[^\d.]", "", val)
-        return float(clean) if clean else 0.0
-    return 0.0
+# ── Search results page ───────────────────────────────────────────────────────
 
-
-def _str(val) -> str:
-    return str(val).strip() if val is not None else ""
-
-
-def _norm_listing(raw: dict, listing_type: str) -> dict | None:
-    lid = _str(
-        raw.get("id") or raw.get("listingId") or raw.get("listing_id")
-    )
-    if not lid:
-        return None
-
-    url_path = _str(
-        raw.get("listingUrl") or raw.get("url") or raw.get("listing_url")
-    )
-    url = url_path if url_path.startswith("http") else urljoin(LISTING_BASE_URL, url_path)
-
-    return {
-        "id": lid,
-        "type": listing_type,
-        "url": url,
-        "title": _str(raw.get("name") or raw.get("title") or raw.get("listing_title")),
-        "address": _str(
-            raw.get("address") or raw.get("formattedAddress") or
-            raw.get("formatted_address") or raw.get("streetName") or
-            raw.get("street_name")
-        ),
-        "price": _int(raw.get("price") or raw.get("askingPrice") or raw.get("asking_price")),
-        "psf": _float(
-            raw.get("unitPrice") or raw.get("pricePerSqft") or
-            raw.get("psf") or raw.get("price_per_sqft")
-        ),
-        "bedrooms": _str(
-            raw.get("bedroomFormatted") or raw.get("bedroom") or raw.get("bedrooms")
-        ),
-        "bathrooms": _str(
-            raw.get("bathroomFormatted") or raw.get("bathroom") or raw.get("bathrooms")
-        ),
-        "size_sqft": _str(
-            raw.get("size") or raw.get("floorSize") or raw.get("floor_size") or
-            raw.get("landSize")
-        ),
-        "floor_level": _str(raw.get("floorLevel") or raw.get("floor_level")),
-        "estate": _str(raw.get("hdbEstate") or raw.get("hdb_estate")),
-        "property_type": _str(
-            raw.get("propertyTypeCode") or raw.get("property_type_code") or
-            raw.get("propertyType")
-        ),
-        "nearest_mrt": _str(
-            raw.get("nearestMrt") or raw.get("nearest_mrt") or
-            raw.get("mrtStation") or raw.get("mrt_station")
-        ),
-        "mrt_distance": _str(
-            raw.get("nearestMrtDistance") or raw.get("mrt_distance") or
-            raw.get("mrtDistance")
-        ),
-        "listed_date": _str(
-            raw.get("listedAt") or raw.get("listed_at") or
-            raw.get("listDate") or raw.get("list_date")
-        ),
-        "updated_date": _str(
-            raw.get("updatedAt") or raw.get("updated_at") or raw.get("updateDate")
-        ),
-        "remaining_lease": _str(
-            raw.get("remainingLease") or raw.get("remaining_lease") or
-            raw.get("tenure") or raw.get("leaseInfo")
-        ),
-        "top_year": _str(raw.get("topYear") or raw.get("top_year") or raw.get("completionYear")),
-        "description": _str(
-            raw.get("description") or raw.get("listingDescription") or
-            raw.get("remarks")
-        ),
-        "has_ongoing_offer": False,
-        "extension_required": False,
-        "fetch_detail": True,
-    }
-
-
-def _parse_next_data_listings(data: dict, listing_type: str) -> list[dict]:
-    if not data:
-        return []
-    props = data.get("props", {}).get("pageProps", {})
-    raw_list = (
-        props.get("listings") or
-        props.get("searchResult", {}).get("listings") or
-        props.get("data", {}).get("listings") or
-        props.get("initialData", {}).get("listings") or
-        props.get("searchData", {}).get("listings") or
-        []
-    )
-    result = []
-    for item in raw_list:
-        norm = _norm_listing(item, listing_type)
-        if norm:
-            result.append(norm)
-    return result
-
-
-def _parse_html_listings(html: str, listing_type: str) -> list[dict]:
-    """Fallback: extract minimal listing info from raw HTML."""
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-    cards = soup.select("[data-listing-id], .listing-card, [class*='ListingCard']")
-    for card in cards:
-        lid = card.get("data-listing-id") or card.get("data-id", "")
-        link = card.select_one("a[href*='property-for-sale'], a[href*='/listing/']")
-        url = urljoin(LISTING_BASE_URL, link["href"]) if link else ""
-        if not lid and url:
-            m = re.search(r"-(\d{6,})(?:[/?#]|$)", url)
-            lid = m.group(1) if m else ""
-        if not lid:
-            continue
-        price_el = card.select_one("[class*='price'], [class*='Price']")
-        addr_el = card.select_one("h3, h2, [class*='address'], [class*='title']")
-        results.append({
+def _extract_stubs(html: str, listing_type: str) -> dict[str, dict]:
+    """Return {listing_id: stub_dict} from contactAgentCardData on search results page."""
+    nd = _next_data(html)
+    cad = _page_data(nd).get("data", {}).get("contactAgentCardData", {})
+    stubs = {}
+    for lid, info in cad.items():
+        url = info.get("url", "")
+        if url and not url.startswith("http"):
+            url = urljoin(LISTING_BASE_URL, url)
+        stubs[lid] = {
             "id": lid,
             "type": listing_type,
             "url": url,
-            "title": addr_el.get_text(strip=True) if addr_el else "",
-            "address": addr_el.get_text(strip=True) if addr_el else "",
-            "price": _int(price_el.get_text() if price_el else ""),
-            "psf": 0.0,
-            "bedrooms": "", "bathrooms": "", "size_sqft": "", "floor_level": "",
-            "estate": "", "property_type": "", "nearest_mrt": "", "mrt_distance": "",
-            "listed_date": "", "updated_date": "", "remaining_lease": "", "top_year": "",
-            "description": "",
-            "has_ongoing_offer": False,
-            "extension_required": False,
-            "fetch_detail": True,
-        })
-    return results
-
-
-def _total_pages(html: str, data: dict) -> int:
-    props = data.get("props", {}).get("pageProps", {}) if data else {}
-    for path in [
-        lambda p: p.get("totalPages"),
-        lambda p: p.get("searchResult", {}).get("totalPages"),
-        lambda p: p.get("pagination", {}).get("totalPage"),
-        lambda p: p.get("data", {}).get("totalPages"),
-        lambda p: p.get("searchData", {}).get("totalPages"),
-    ]:
-        val = path(props)
-        if val:
-            try:
-                return int(val)
-            except (ValueError, TypeError):
-                pass
-    # HTML fallback
-    soup = BeautifulSoup(html, "lxml")
-    nums = [
-        int(el.get_text())
-        for el in soup.select(".pagination a, [class*='pagination'] a")
-        if el.get_text().strip().isdigit()
-    ]
-    return max(nums) if nums else 1
+            "price": info.get("price", 0),
+            "address": info.get("propertyName", ""),
+            "bedrooms": str(info.get("bedrooms", "")),
+        }
+    return stubs
 
 
 # ── Detail page ───────────────────────────────────────────────────────────────
 
-def _enrich_from_detail(url: str, client: httpx.Client) -> dict:
+def _parse_details_items(items: list) -> dict:
+    """Extract fields from detailsData.metatable.items list."""
+    result = {}
+    for item in items:
+        icon = item.get("icon", "")
+        val = item.get("value", "")
+        if not val:
+            continue
+        if "layers-2" in icon:
+            result["floor_level"] = re.sub(r"\s*floor\s*level\s*", "", val, flags=re.I).strip()
+        elif "calendar-time" in icon:
+            # "Listed on 19 Aug 2026"
+            m = re.search(r"Listed on (.+)", val, re.I)
+            if m:
+                result["listed_date"] = m.group(1).strip()
+        elif "document-with-lines" in icon:
+            if "TOP in" in val:
+                result["top_info"] = val  # e.g., "TOP in Aug 2012"
+                yr = re.search(r"\d{4}", val)
+                if yr:
+                    result["top_year"] = yr.group()
+    return result
+
+
+def _remaining_lease(listing_data: dict, detail_extras: dict) -> str:
+    """Compute remaining lease string for HDB."""
+    top_year = detail_extras.get("top_year") or listing_data.get("completionYear")
+    tenure = listing_data.get("tenure", "")
+    if top_year and "L99" in tenure:
+        try:
+            years_elapsed = 2026 - int(top_year)
+            remaining = 99 - years_elapsed
+            return f"{remaining} years (TOP {top_year})"
+        except ValueError:
+            pass
+    return str(listing_data.get("tenure", ""))
+
+
+def _extract_mrt_from_desc(desc: str) -> tuple[str, str]:
+    """Return (nearest_mrt_name, distance_text) extracted from listing description."""
+    mrt_name = ""
+    mrt_dist = ""
+    m = _MRT_RE.search(desc)
+    if m:
+        mrt_name = m.group(1).strip().title() + " MRT"
+    d = _MRT_DIST_RE.search(desc)
+    if d:
+        mrt_dist = d.group(0).strip()
+    return mrt_name, mrt_dist
+
+
+def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str) -> dict:
     try:
-        html = _fetch(url, client, delay=1.8)
+        html = _fetch(url, client, referer=search_url, delay=1.8)
     except Exception as e:
         print(f"    ⚠ detail fetch failed: {e}")
         return {}
 
+    nd = _next_data(html)
+    pd = _page_data(nd).get("data", {})
+
+    listing_data = pd.get("listingData", {})
+    details_items = pd.get("detailsData", {}).get("metatable", {}).get("items", [])
+    desc_data = pd.get("descriptionBlockData", {})
+    description = desc_data.get("description", "") or ""
+
+    detail_extras = _parse_details_items(details_items)
+
+    # Full text for ongoing offer check
     full_text = BeautifulSoup(html, "lxml").get_text(" ", strip=True)
-    result: dict = {}
+    has_ongoing = bool(_ONGOING_RE.search(full_text))
 
-    # Check ongoing offer
-    result["has_ongoing_offer"] = bool(_ONGOING_OFFER_RE.search(full_text))
+    # Extension of stay — scoped to the listing description only (full-page text
+    # picks up unrelated site boilerplate/FAQ mentions of "extension of stay").
+    # "No extension needed/required/requested" (or "move in immediately" etc.)
+    # overrides a positive match. No mention either way → unknown (None), not False.
+    _has_ext_neg = bool(_EXT_NEG_RE.search(description))
+    _has_ext_pos = bool(_EXT_POS_RE.search(description))
+    if not _has_ext_neg and not _has_ext_pos:
+        ext_req = None
+    else:
+        ext_req = _has_ext_pos and not _has_ext_neg
 
-    # Extension of stay
-    result["extension_required"] = bool(
-        re.search(
-            r"extension\s+of\s+stay|extension\s+required|seller.*extension|owner.*extension",
-            full_text,
-            re.I,
-        )
-    )
+    is_corner_unit = bool(_CORNER_RE.search(description))
 
-    # Enrich from __NEXT_DATA__ if present
-    data = _next_data(html)
-    if data:
-        props = data.get("props", {}).get("pageProps", {})
-        raw = (
-            props.get("listing") or
-            props.get("data", {}).get("listing") or
-            props.get("initialData", {}).get("listing") or
-            {}
-        )
-        if raw:
-            norm = _norm_listing(raw, "")
-            if norm:
-                for k, v in norm.items():
-                    if v:
-                        result[k] = v
+    mrt_name, mrt_dist = _extract_mrt_from_desc(description)
 
-    # Fallback: remaining lease
-    if not result.get("remaining_lease"):
-        m = re.search(
-            r"(\d+)\s+years?\s+(?:\d+\s+months?\s+)?remaining(?:\s+lease)?",
-            full_text,
-            re.I,
-        )
-        if m:
-            result["remaining_lease"] = f"{m.group(1)} years"
+    # hdbEstate from listingData
+    estate_text = listing_data.get("hdbEstateText", "")
+    # estate code mapping (for backwards compat with email_formatter)
+    _estate_text_to_code = {"Ang Mo Kio": "1", "Bishan": "25", "Toa Payoh": "3"}
+    estate_code = _estate_text_to_code.get(estate_text, estate_text)
 
-    return result
+    return {
+        "id": str(listing_data.get("listingId", "")),
+        "address": listing_data.get("propertyName") or listing_data.get("streetName", ""),
+        "price": listing_data.get("price", 0),
+        "psf": listing_data.get("floorAreaPsf", 0),
+        "size_sqft": str(listing_data.get("floorArea", "") or ""),
+        "bedrooms": str(listing_data.get("bedrooms", "") or ""),
+        "bathrooms": str(listing_data.get("bathrooms", "") or ""),
+        "property_type": listing_data.get("hdbTypeCode") or listing_data.get("propertyTypeCode", ""),
+        "estate": estate_code,
+        "floor_level": detail_extras.get("floor_level", ""),
+        "listed_date": detail_extras.get("listed_date", ""),
+        "top_year": detail_extras.get("top_year", ""),
+        "remaining_lease": _remaining_lease(listing_data, detail_extras),
+        "nearest_mrt": mrt_name,
+        "mrt_distance": mrt_dist,
+        "description": description[:3000],
+        "has_ongoing_offer": has_ongoing,
+        "extension_required": ext_req,
+        "is_corner_unit": is_corner_unit,
+    }
 
 
-# ── Main scrape function ──────────────────────────────────────────────────────
+# ── Main scrape ───────────────────────────────────────────────────────────────
 
-def scrape_listings(
-    url_builder,
-    listing_type: str,
-    listed_in_days: int | None = None,
-) -> list[dict]:
-    all_listings: list[dict] = []
-    seen_ids: set[str] = set()
+def scrape_listings(url_builder, listing_type: str, listed_in_days=None) -> list[dict]:
+    all_stubs: dict[str, dict] = {}
+    search_url = url_builder(page=1, listed_in_days=listed_in_days)
 
     with _client() as client:
-        url = url_builder(page=1, listed_in_days=listed_in_days)
-        print(f"  Page 1 → {url}")
-        try:
-            html = _fetch(url, client, delay=3.0)
-        except httpx.HTTPStatusError as e:
-            print(f"  ✗ HTTP {e.response.status_code} — PropertyGuru may be blocking. Try again later.")
-            return []
-
-        data = _next_data(html)
-        listings = _parse_next_data_listings(data, listing_type)
-        if not listings:
-            listings = _parse_html_listings(html, listing_type)
-
-        for lst in listings:
-            if lst["id"] not in seen_ids:
-                seen_ids.add(lst["id"])
-                all_listings.append(lst)
-
-        total = min(_total_pages(html, data), MAX_PAGES_PER_RUN)
-        print(f"  Page 1: {len(listings)} listings (total pages: {total})")
-
-        for page in range(2, total + 1):
+        # Phase 1: collect listing stubs from search pages
+        prev_url = None
+        for page in range(1, MAX_PAGES_PER_RUN + 1):
             url = url_builder(page=page, listed_in_days=listed_in_days)
             print(f"  Page {page} → {url}")
             try:
-                html = _fetch(url, client, delay=2.5)
+                html = _fetch(url, client, referer=prev_url, delay=3.0 if page == 1 else 2.5)
             except Exception as e:
                 print(f"  ✗ Page {page} failed: {e}")
                 break
-            data = _next_data(html)
-            listings = _parse_next_data_listings(data, listing_type)
-            if not listings:
-                listings = _parse_html_listings(html, listing_type)
-            new = [l for l in listings if l["id"] not in seen_ids]
-            for lst in new:
-                seen_ids.add(lst["id"])
-            all_listings.extend(new)
-            print(f"  Page {page}: {len(new)} new listings")
 
-        # Fetch detail pages
-        print(f"\n  Fetching {len(all_listings)} detail pages…")
-        for i, listing in enumerate(all_listings):
-            if not listing.get("url"):
+            stubs = _extract_stubs(html, listing_type)
+            if not stubs:
+                print(f"  No listings on page {page}, stopping pagination")
+                break
+
+            new_count = 0
+            for lid, stub in stubs.items():
+                if lid not in all_stubs:
+                    all_stubs[lid] = stub
+                    new_count += 1
+            print(f"  Page {page}: {new_count} new stubs (total: {len(all_stubs)})")
+            prev_url = url
+
+        # Phase 2: fetch each listing detail page
+        listings = []
+        total = len(all_stubs)
+        print(f"\n  Fetching {total} detail pages…")
+        for i, (lid, stub) in enumerate(all_stubs.items()):
+            if not stub.get("url"):
+                listings.append(stub)
                 continue
-            print(
-                f"  [{i+1}/{len(all_listings)}] "
-                f"{listing.get('address') or listing['id']}"
-            )
-            extra = _enrich_from_detail(listing["url"], client)
-            for k, v in extra.items():
-                if v and not listing.get(k):
-                    listing[k] = v
-                elif k in ("has_ongoing_offer", "extension_required"):
-                    listing[k] = v  # always override these flags
+            print(f"  [{i+1}/{total}] {stub.get('address') or lid}")
+            extra = _enrich_from_detail(stub["url"], client, search_url)
+            merged = {**stub, **{k: v for k, v in extra.items() if v}}
+            # Always use detail values for these flags
+            for flag in ("has_ongoing_offer", "extension_required", "is_corner_unit"):
+                if flag in extra:
+                    merged[flag] = extra[flag]
+            listings.append(merged)
 
-    return all_listings
+    return listings

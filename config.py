@@ -23,14 +23,15 @@ MRT_STATION_MAP = {
 BASE_URL = "https://www.propertyguru.com.sg/property-for-sale"
 LISTING_BASE_URL = "https://www.propertyguru.com.sg"
 
-EMAIL_TO = "awxinmin@gmail.com"
+EMAIL_TO = "for.ai.awxm@gmail.com"
 STATE_FILE = "data/state.json"
 LISTINGS_FILE = "data/listings.json"
 EMAIL_OUTPUT_FILE = "data/email_output.json"
+PENDING_ANALYSIS_FILE = "data/pending_analysis.json"
 
 MAX_PAGES_PER_RUN = 15
 LISTED_IN_DAYS = 7          # filter window for daily (non-first) runs
-MAX_ANALYZE_FIRST_RUN = 60  # cap analysis calls on first run
+MAX_ANALYZE_FIRST_RUN = 165  # cap analysis calls on first run
 
 # HDB market PSF benchmarks (S$/sqft) for value scoring
 HDB_PSF_MARKET = {
