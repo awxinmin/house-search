@@ -16,7 +16,6 @@ from openpyxl import Workbook
 from config import (
     GOOGLE_SERVICE_ACCOUNT_FILE,
     GOOGLE_SHEET_ID,
-    GOOGLE_SHEET_WORKSHEET,
     LISTED_IN_DAYS,
     LOCAL_EXCEL_FILE,
     MAX_FIRST_RUN_LISTINGS,
@@ -28,7 +27,7 @@ _SHEET_COLUMNS = [
     "id", "type", "address", "price", "psf", "size_sqft", "bedrooms", "bathrooms",
     "property_type", "estate", "floor_level", "listed_date", "top_year",
     "remaining_lease", "nearest_mrt", "mrt_distance", "is_corner_unit",
-    "extension_required", "url", "description",
+    "extension_required", "url", "description", "scraped_date",
 ]
 
 
@@ -86,10 +85,19 @@ def _sheet_row(listing: dict) -> list:
     return row
 
 
-def _export_to_excel(rows: list):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = GOOGLE_SHEET_WORKSHEET
+def _export_to_excel(rows: list, tab_name: str):
+    if os.path.exists(LOCAL_EXCEL_FILE):
+        wb = load_workbook(LOCAL_EXCEL_FILE)
+        if tab_name in wb.sheetnames:
+            del wb[tab_name]
+        ws = wb.create_sheet(title=tab_name)
+        if "Sheet" in wb.sheetnames and wb["Sheet"].max_row == 1 and wb["Sheet"].max_column == 1:
+            del wb["Sheet"]  # drop openpyxl's default blank sheet, if still present
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = tab_name
+
     ws.append(_SHEET_COLUMNS)
     for row in rows:
         ws.append(row)
@@ -97,26 +105,27 @@ def _export_to_excel(rows: list):
     wb.save(LOCAL_EXCEL_FILE)
     print(
         f"GOOGLE_SERVICE_ACCOUNT_FILE ('{GOOGLE_SERVICE_ACCOUNT_FILE}') not found — "
-        f"wrote {len(rows)} listings to {LOCAL_EXCEL_FILE} instead."
+        f"wrote {len(rows)} listings to tab '{tab_name}' in {LOCAL_EXCEL_FILE} instead."
     )
 
 
-def _export_to_sheet(rows: list):
+def _export_to_sheet(rows: list, tab_name: str):
     gc = gspread.service_account(filename=GOOGLE_SERVICE_ACCOUNT_FILE)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
-        ws = sh.worksheet(GOOGLE_SHEET_WORKSHEET)
+        ws = sh.worksheet(tab_name)
+        ws.clear()
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GOOGLE_SHEET_WORKSHEET, rows=len(rows) + 1, cols=len(_SHEET_COLUMNS))
+        ws = sh.add_worksheet(title=tab_name, rows=len(rows) + 1, cols=len(_SHEET_COLUMNS))
 
-    ws.clear()
     ws.update([_SHEET_COLUMNS] + rows, "A1")
 
-    print(f"Wrote {len(rows)} listings to sheet '{GOOGLE_SHEET_WORKSHEET}' in {sh.url}")
+    print(f"Wrote {len(rows)} listings to tab '{tab_name}' in {sh.url}")
 
 
 def export_listings():
-    """Export data/listings.json to a Google Sheet, or a local .xlsx as a fallback.
+    """Export today's newly-scraped listings to a new Google Sheet tab (named by
+    today's date), or to a same-named sheet in a local .xlsx as a fallback.
 
     Google Sheets setup (one-time, optional):
       1. Create a GCP service account and download its JSON key to the path in
@@ -126,24 +135,31 @@ def export_listings():
          spreadsheet ID from its URL.
 
     Without that key file present, listings are written to a local .xlsx
-    (config.LOCAL_EXCEL_FILE) instead — no setup required.
+    (config.LOCAL_EXCEL_FILE) instead — no setup required. Re-running on the
+    same day overwrites that day's tab rather than duplicating it.
     """
     listings = load_listings()
     if not listings:
         print("data/listings.json is empty — skipping export.")
         return
 
-    rows = [_sheet_row(l) for l in sorted(listings.values(), key=lambda l: (l.get("type", ""), int(l.get("price") or 0)))]
+    today_str = str(date.today())
+    todays = [l for l in listings.values() if l.get("scraped_date") == today_str]
+    if not todays:
+        print(f"No listings with scraped_date={today_str} — skipping export.")
+        return
+
+    rows = [_sheet_row(l) for l in sorted(todays, key=lambda l: (l.get("type", ""), int(l.get("price") or 0)))]
 
     if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
-        _export_to_excel(rows)
+        _export_to_excel(rows, today_str)
         return
 
     if not GOOGLE_SHEET_ID:
         print("GOOGLE_SHEET_ID not set in config.py — skipping Sheets export.")
         return
 
-    _export_to_sheet(rows)
+    _export_to_sheet(rows, today_str)
 
 
 def main():

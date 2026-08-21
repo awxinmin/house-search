@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+house_search_agent_service_account_key.json
+service_account*.json

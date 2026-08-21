@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
+from datetime import date
 
 from config import BASE_URL, LISTING_BASE_URL, MAX_PAGES_PER_RUN
 
@@ -78,7 +79,7 @@ def build_hdb_url(page: int = 1, listed_in_days=None) -> str:
             ("bedrooms", "3"),
             ("minSize", "1000"),
             ("distanceToMRT", "0.75"),
-            ("minTopYear", "1990"),
+            ("minTopYear", "2000"),
         ],
         page, listed_in_days,
     )
@@ -243,7 +244,11 @@ def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str
     else:
         ext_req = _has_ext_pos and not _has_ext_neg
 
-    is_corner_unit = bool(_CORNER_RE.search(description))
+    _is_corner_unit = bool(_CORNER_RE.search(description))
+    if not _is_corner_unit:
+        is_corner_unit = None
+    else:
+        is_corner_unit = _is_corner_unit
 
     mrt_name, mrt_dist = _extract_mrt_from_desc(description)
 
@@ -252,6 +257,8 @@ def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str
     # estate code mapping
     _estate_text_to_code = {"Ang Mo Kio": "1", "Bishan": "25", "Toa Payoh": "3"}
     estate_code = _estate_text_to_code.get(estate_text, estate_text)
+
+    today = date.today()
 
     return {
         "id": str(listing_data.get("listingId", "")),
@@ -273,6 +280,7 @@ def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str
         "has_ongoing_offer": has_ongoing,
         "extension_required": ext_req,
         "is_corner_unit": is_corner_unit,
+        "scraped_date": str(today)
     }
 
 
