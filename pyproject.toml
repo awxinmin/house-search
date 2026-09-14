@@ -8,6 +8,4 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "curl-cffi>=0.16.0",
-    "gspread>=6.2.1",
-    "openpyxl>=3.1.5",
 ]
