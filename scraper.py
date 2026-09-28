@@ -12,7 +12,6 @@ from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
-from datetime import date
 
 from config import BASE_URL, LISTING_BASE_URL, MAX_PAGES_PER_RUN
 
@@ -63,7 +62,7 @@ _MRT_DIST_RE = re.compile(
 def _build_url(base_params: list, page: int, listed_in_days) -> str:
     p = list(base_params)
     if listed_in_days:
-        p.append(("lastPosted", str(listed_in_days)))
+        p.append(("listedIn", str(listed_in_days)))
     if page > 1:
         p.append(("page", str(page)))
     return f"{BASE_URL}?{urlencode(p)}"
@@ -79,7 +78,7 @@ def build_hdb_url(page: int = 1, listed_in_days=None) -> str:
             ("bedrooms", "3"),
             ("minSize", "1000"),
             ("distanceToMRT", "0.75"),
-            ("minTopYear", "2000"),
+            ("minTopYear", "1990"),
         ],
         page, listed_in_days,
     )
@@ -244,21 +243,15 @@ def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str
     else:
         ext_req = _has_ext_pos and not _has_ext_neg
 
-    _is_corner_unit = bool(_CORNER_RE.search(description))
-    if not _is_corner_unit:
-        is_corner_unit = None
-    else:
-        is_corner_unit = _is_corner_unit
+    is_corner_unit = bool(_CORNER_RE.search(description))
 
     mrt_name, mrt_dist = _extract_mrt_from_desc(description)
 
     # hdbEstate from listingData
     estate_text = listing_data.get("hdbEstateText", "")
-    # estate code mapping
+    # estate code mapping (for backwards compat with email_formatter)
     _estate_text_to_code = {"Ang Mo Kio": "1", "Bishan": "25", "Toa Payoh": "3"}
     estate_code = _estate_text_to_code.get(estate_text, estate_text)
-
-    today = date.today()
 
     return {
         "id": str(listing_data.get("listingId", "")),
@@ -280,18 +273,12 @@ def _enrich_from_detail(url: str, client: cffi_requests.Session, search_url: str
         "has_ongoing_offer": has_ongoing,
         "extension_required": ext_req,
         "is_corner_unit": is_corner_unit,
-        "scraped_date": str(today)
     }
 
 
 # ── Main scrape ───────────────────────────────────────────────────────────────
 
-def scrape_listings(url_builder, listing_type: str, listed_in_days=None, known_ids: set[str] = frozenset()) -> list[dict]:
-    """Scrape search results + detail pages, skipping detail fetches for listings already in `known_ids`.
-
-    Detail-page fetches are the slow, rate-limited part (~2s each); skipping known
-    listings before fetching their detail page is what makes repeat runs fast.
-    """
+def scrape_listings(url_builder, listing_type: str, listed_in_days=None) -> list[dict]:
     all_stubs: dict[str, dict] = {}
     search_url = url_builder(page=1, listed_in_days=listed_in_days)
 
@@ -320,14 +307,11 @@ def scrape_listings(url_builder, listing_type: str, listed_in_days=None, known_i
             print(f"  Page {page}: {new_count} new stubs (total: {len(all_stubs)})")
             prev_url = url
 
-        # Phase 2: fetch detail pages for stubs not already known
-        to_fetch = {lid: stub for lid, stub in all_stubs.items() if lid not in known_ids}
-        skipped = len(all_stubs) - len(to_fetch)
-        print(f"\n  {len(all_stubs)} stubs found, {skipped} already known (skipped), fetching {len(to_fetch)} detail pages…")
-
+        # Phase 2: fetch each listing detail page
         listings = []
-        total = len(to_fetch)
-        for i, (lid, stub) in enumerate(to_fetch.items()):
+        total = len(all_stubs)
+        print(f"\n  Fetching {total} detail pages…")
+        for i, (lid, stub) in enumerate(all_stubs.items()):
             if not stub.get("url"):
                 listings.append(stub)
                 continue
